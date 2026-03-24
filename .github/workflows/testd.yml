@@ -1,0 +1,240 @@
+name: TestD E2E Tests
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+      base_branch:
+        required: false
+        type: string
+        default: main
+      pr_number:
+        required: true
+        type: string
+      actor:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      environments:
+        required: false
+        type: string
+        default: '["mock"]'
+    secrets:
+      TESTD_JWT_TOKEN:
+        required: true
+      GH_TOKEN:
+        required: true
+
+jobs:
+  start_run:
+    name: Start TestD Run
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    outputs:
+      run_id: ${{ steps.start_run.outputs.run_id }}
+      recordings: ${{ steps.start_run.outputs.recordings }}
+    steps:
+      - name: Start TestD run
+        id: start_run
+        env:
+          BRANCH: ${{ inputs.branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          ACTOR: ${{ inputs.actor }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ENVIRONMENTS: ${{ inputs.environments }}
+        run: |
+          USER_EMAIL=$(gh api "users/$ACTOR" --jq '.email // empty')
+          USER_EMAIL="${USER_EMAIL:-$ACTOR}"
+
+          PAYLOAD=$(jq -n \
+            --arg branch "$BRANCH" \
+            --arg baseBranch "$BASE_BRANCH" \
+            --arg email "$USER_EMAIL" \
+            --argjson environments "$ENVIRONMENTS" \
+            '{"branch": $branch, "baseBranch": $baseBranch, "environments": $environments, "userEmail": $email}')
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ secrets.TESTD_JWT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            https://testd.kloudfuse.dev/api/runs) || {
+            echo "curl failed with exit code $?"
+            exit 1
+          }
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+          echo "Response body: $BODY"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Failed to start TestD run (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          RUN_ID=$(echo "$BODY" | jq -r '.id')
+          RECORDINGS=$(echo "$BODY" | jq -c '.recordings')
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "recordings=$RECORDINGS" >> "$GITHUB_OUTPUT"
+          echo "Started TestD run: $RUN_ID"
+
+      - name: Post loading comment
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RUN_ID: ${{ steps.start_run.outputs.run_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPO: ${{ inputs.repository }}
+        run: |
+          STARTED_AT=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          BODY=$(printf "## testd Summary\n\n:hourglass_flowing_sand: Tests are running...\n\nStarted at: %s\n\nhttps://testd.kloudfuse.dev/runs/%s" "$STARTED_AT" "$RUN_ID")
+          PAYLOAD=$(jq -n --arg body "$BODY" '{"body": $body}')
+
+          EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("## testd Summary")) | .id' | head -1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH --input -
+          else
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/$PR_NUMBER/comments" -X POST --input -
+          fi
+
+  poll_recording:
+    name: ${{ matrix.recording.testName }}
+    needs: start_run
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        recording: ${{ fromJson(needs.start_run.outputs.recordings) }}
+    steps:
+      - name: Subscribe to recording updates
+        env:
+          RECORDING_ID: ${{ matrix.recording.id }}
+          TESTD_JWT_TOKEN: ${{ secrets.TESTD_JWT_TOKEN }}
+        run: |
+          pip install websocket-client -q
+
+          {
+            echo 'import websocket, json, os'
+            echo "msg = json.dumps({'type': 'subscribe', 'objectId': 'recordings:' + os.environ['RECORDING_ID'] + ':output'})"
+            echo "token = 'Authorization: Bearer ' + os.environ['TESTD_JWT_TOKEN']"
+            echo "websocket.WebSocketApp('wss://testd.kloudfuse.dev/api/ws', header=[token], on_open=lambda ws: ws.send(msg), on_message=lambda ws, m: print(json.loads(m).get('line', ''), flush=True)).run_forever()"
+          } > /tmp/ws_listener.py
+
+          python3 /tmp/ws_listener.py &
+          echo "WebSocket listener started (PID: $!)"
+
+      - name: Poll recording status
+        env:
+          RECORDING_ID: ${{ matrix.recording.id }}
+        run: |
+          while true; do
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.TESTD_JWT_TOKEN }}" \
+              https://testd.kloudfuse.dev/api/recordings/$RECORDING_ID) || {
+              echo "curl failed with exit code $?"
+              exit 1
+            }
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n-1)
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "Failed to poll recording (HTTP $HTTP_CODE): $BODY"
+              exit 1
+            fi
+
+            STATUS=$(echo "$BODY" | jq -r '.status')
+            echo "Recording status: $STATUS"
+
+            case "$STATUS" in
+              passed)
+                echo "Recording passed."
+                exit 0
+                ;;
+              failed|error)
+                echo "::warning::Recording $STATUS."
+                exit 0
+                ;;
+              pending|running)
+                sleep 10
+                ;;
+              *)
+                echo "::warning::Unknown status: $STATUS"
+                exit 0
+                ;;
+            esac
+          done
+
+  summary:
+    name: TestD Summary
+    needs: [start_run, poll_recording]
+    runs-on: ubuntu-latest
+    if: always() && needs.start_run.result == 'success'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TESTD_JWT_TOKEN: ${{ secrets.TESTD_JWT_TOKEN }}
+          RUN_ID: ${{ needs.start_run.outputs.run_id }}
+          RECORDINGS: ${{ needs.start_run.outputs.recordings }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPO: ${{ inputs.repository }}
+        run: |
+          TOTAL=$(echo "$RECORDINGS" | jq 'length')
+          FAILURES=0
+          COMMENT_FILE=$(mktemp)
+
+          while IFS= read -r recording; do
+            ID=$(echo "$recording" | jq -r '.id')
+            TEST_NAME=$(echo "$recording" | jq -r '.testName')
+
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer $TESTD_JWT_TOKEN" \
+              "https://testd.kloudfuse.dev/api/recordings/$ID") || {
+              echo "curl failed with exit code $?"
+              exit 1
+            }
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n-1)
+            STATUS=$(echo "$BODY" | jq -r '.status')
+
+            if [ "$STATUS" != "passed" ]; then
+              FAILURES=$((FAILURES + 1))
+              printf "\n### %s\n" "$TEST_NAME" >> "$COMMENT_FILE"
+
+              DIFF_COUNT=0
+              while IFS= read -r diff_url; do
+                printf '<img src="%s" style="max-height:200px">\n' "$diff_url" >> "$COMMENT_FILE"
+                DIFF_COUNT=$((DIFF_COUNT + 1))
+              done < <(echo "$BODY" | jq -r '.screenshots[] | .diffImageUrl | select(. != null and . != "")')
+
+              if [ "$DIFF_COUNT" -eq 0 ]; then
+                printf "No diff image captured\n" >> "$COMMENT_FILE"
+              fi
+            fi
+          done < <(echo "$RECORDINGS" | jq -c '.[]')
+
+          if [ "$FAILURES" -eq 0 ]; then
+            SUMMARY="All $TOTAL tests passed!"
+          else
+            SUMMARY="$FAILURES of $TOTAL failed!"
+          fi
+
+          FINAL=$(printf "## testd Summary\n\n%s\n\nhttps://testd.kloudfuse.dev/runs/%s\n%s" "$SUMMARY" "$RUN_ID" "$(cat "$COMMENT_FILE")")
+          PAYLOAD=$(jq -n --arg body "$FINAL" '{"body": $body}')
+
+          EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("## testd Summary")) | .id' | head -1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH --input -
+          else
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/$PR_NUMBER/comments" -X POST --input -
+          fi
