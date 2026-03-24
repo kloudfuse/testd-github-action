@@ -35,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_id: ${{ steps.start_run.outputs.run_id }}
-      recordings: ${{ steps.start_run.outputs.recordings }}
     steps:
       - name: Start TestD run
         id: start_run
@@ -74,9 +73,7 @@ jobs:
           fi
 
           RUN_ID=$(echo "$BODY" | jq -r '.id')
-          RECORDINGS=$(echo "$BODY" | jq -c '.recordings')
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "recordings=$RECORDINGS" >> "$GITHUB_OUTPUT"
           echo "Started TestD run: $RUN_ID"
 
       - name: Post loading comment
@@ -100,14 +97,98 @@ jobs:
           fi
 
   poll_and_summarize:
-    name: TestD Recordings
+    name: TestD Poll & Summarize
     needs: start_run
-    uses: ./.github/workflows/testd-poll.yml
-    with:
-      run_id: ${{ needs.start_run.outputs.run_id }}
-      recordings: ${{ needs.start_run.outputs.recordings }}
-      pr_number: ${{ inputs.pr_number }}
-      repository: ${{ inputs.repository }}
-    secrets:
-      TESTD_JWT_TOKEN: ${{ secrets.TESTD_JWT_TOKEN }}
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poll run until complete
+        id: poll
+        env:
+          RUN_ID: ${{ needs.start_run.outputs.run_id }}
+        run: |
+          echo "Polling run $RUN_ID..."
+          while true; do
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.TESTD_JWT_TOKEN }}" \
+              "https://testd.kloudfuse.dev/api/runs/$RUN_ID") || {
+              echo "curl failed with exit code $?"
+              exit 1
+            }
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n-1)
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "Failed to poll run (HTTP $HTTP_CODE): $BODY"
+              exit 1
+            fi
+
+            STATUS=$(echo "$BODY" | jq -r '.status')
+            TESTS_RUN=$(echo "$BODY" | jq -r '.testsRunCount // 0')
+            TESTS_SUCCESS=$(echo "$BODY" | jq -r '.testsSuccessCount // 0')
+            echo "Run status: $STATUS ($TESTS_SUCCESS/$TESTS_RUN passed)"
+
+            case "$STATUS" in
+              pending|running)
+                sleep 10
+                ;;
+              *)
+                echo "run_payload<<PAYLOAD_EOF" >> "$GITHUB_OUTPUT"
+                echo "$BODY" >> "$GITHUB_OUTPUT"
+                echo "PAYLOAD_EOF" >> "$GITHUB_OUTPUT"
+                echo "Run finished with status: $STATUS"
+                break
+                ;;
+            esac
+          done
+
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          RUN_PAYLOAD: ${{ steps.poll.outputs.run_payload }}
+          RUN_ID: ${{ needs.start_run.outputs.run_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPO: ${{ inputs.repository }}
+        run: |
+          RECORDINGS=$(echo "$RUN_PAYLOAD" | jq -c '.recordings')
+          TOTAL=$(echo "$RECORDINGS" | jq 'length')
+          FAILURES=0
+          COMMENT_FILE=$(mktemp)
+
+          while IFS= read -r recording; do
+            TEST_NAME=$(echo "$recording" | jq -r '.testName')
+            STATUS=$(echo "$recording" | jq -r '.status')
+
+            if [ "$STATUS" != "passed" ]; then
+              FAILURES=$((FAILURES + 1))
+              printf "\n### %s\n" "$TEST_NAME" >> "$COMMENT_FILE"
+
+              DIFF_COUNT=0
+              while IFS= read -r diff_url; do
+                printf '<img src="%s" style="max-height:200px">\n' "$diff_url" >> "$COMMENT_FILE"
+                DIFF_COUNT=$((DIFF_COUNT + 1))
+              done < <(echo "$recording" | jq -r '.screenshots[] | .diffImageUrl | select(. != null and . != "")')
+
+              if [ "$DIFF_COUNT" -eq 0 ]; then
+                printf "No diff image captured\n" >> "$COMMENT_FILE"
+              fi
+            fi
+          done < <(echo "$RECORDINGS" | jq -c '.[]')
+
+          if [ "$FAILURES" -eq 0 ]; then
+            SUMMARY="All $TOTAL tests passed!"
+          else
+            SUMMARY="$FAILURES of $TOTAL failed!"
+          fi
+
+          FINAL=$(printf "## testd Summary\n\n%s\n\nhttps://testd.kloudfuse.dev/runs/%s\n%s" "$SUMMARY" "$RUN_ID" "$(cat "$COMMENT_FILE")")
+          PAYLOAD=$(jq -n --arg body "$FINAL" '{"body": $body}')
+
+          EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("## testd Summary")) | .id' | head -1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH --input -
+          else
+            echo "$PAYLOAD" | gh api "repos/$REPO/issues/$PR_NUMBER/comments" -X POST --input -
+          fi
