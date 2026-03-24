@@ -152,36 +152,88 @@ jobs:
         run: |
           RECORDINGS=$(echo "$RUN_PAYLOAD" | jq -c '.recordings')
           TOTAL=$(echo "$RECORDINGS" | jq 'length')
-          FAILURES=0
+          FAILURES=$(echo "$RECORDINGS" | jq '[.[] | select(.status != "passed")] | length')
           COMMENT_FILE=$(mktemp)
+
+          # Sort: failed recordings first, then passed
+          SORTED=$(echo "$RECORDINGS" | jq -c '[(.[] | select(.status != "passed")), (.[] | select(.status == "passed"))]')
+
+          if [ "$FAILURES" -eq 0 ]; then
+            SUMMARY=":white_check_mark: All $TOTAL tests passed!"
+          else
+            SUMMARY=":x: $FAILURES of $TOTAL failed!"
+          fi
+
+          printf "## testd Summary\n\n%s\n\nhttps://testd.kloudfuse.dev/runs/%s\n" "$SUMMARY" "$RUN_ID" >> "$COMMENT_FILE"
 
           while IFS= read -r recording; do
             TEST_NAME=$(echo "$recording" | jq -r '.testName')
             STATUS=$(echo "$recording" | jq -r '.status')
 
-            if [ "$STATUS" != "passed" ]; then
-              FAILURES=$((FAILURES + 1))
-              printf "\n### %s\n" "$TEST_NAME" >> "$COMMENT_FILE"
-
-              DIFF_COUNT=0
-              while IFS= read -r diff_url; do
-                printf '<img src="%s" style="max-height:200px">\n' "$diff_url" >> "$COMMENT_FILE"
-                DIFF_COUNT=$((DIFF_COUNT + 1))
-              done < <(echo "$recording" | jq -r '.screenshots[] | .diffImageUrl | select(. != null and . != "")')
-
-              if [ "$DIFF_COUNT" -eq 0 ]; then
-                printf "No diff image captured\n" >> "$COMMENT_FILE"
-              fi
+            if [ "$STATUS" = "passed" ]; then
+              printf '\n<details>\n<summary>:white_check_mark: <b>%s</b></summary>\n\n' "$TEST_NAME" >> "$COMMENT_FILE"
+            else
+              printf '\n### :x: %s\n\n' "$TEST_NAME" >> "$COMMENT_FILE"
             fi
-          done < <(echo "$RECORDINGS" | jq -c '.[]')
 
-          if [ "$FAILURES" -eq 0 ]; then
-            SUMMARY="All $TOTAL tests passed!"
-          else
-            SUMMARY="$FAILURES of $TOTAL failed!"
-          fi
+            while IFS= read -r screenshot; do
+              EXPECTED_URL=$(echo "$screenshot" | jq -r '.expectedImageUrl // empty')
+              DIFF_URL=$(echo "$screenshot" | jq -r '.diffImageUrl // empty')
+              RECEIVED_URL=$(echo "$screenshot" | jq -r '.receivedImageUrl // empty')
 
-          FINAL=$(printf "## testd Summary\n\n%s\n\nhttps://testd.kloudfuse.dev/runs/%s\n%s" "$SUMMARY" "$RUN_ID" "$(cat "$COMMENT_FILE")")
+              if [ -z "$EXPECTED_URL" ]; then
+                # Single column mode — no baseline image (matches DiffTable singleColumn)
+                if [ "$STATUS" != "passed" ]; then
+                  RCV_LABEL="🔴 <b>RECEIVED</b>"
+                else
+                  RCV_LABEL="🔵 <b>RECEIVED</b>"
+                fi
+                {
+                  echo '<table>'
+                  echo '<tr>'
+                  printf '<td align="center"><img src="%s" width="280"></td>\n' "$RECEIVED_URL"
+                  echo '</tr>'
+                  echo '<tr>'
+                  printf '<td align="center">%s</td>\n' "$RCV_LABEL"
+                  echo '</tr>'
+                  echo '</table>'
+                  echo ''
+                } >> "$COMMENT_FILE"
+              else
+                # Three column mode — Expected | Diff | Received (matches DiffTable default)
+                if [ -n "$DIFF_URL" ]; then
+                  DIFF_CELL=$(printf '<img src="%s" width="280">' "$DIFF_URL")
+                  DIFF_LABEL="🔴 <b>DIFF</b>"
+                  RCV_LABEL="🔴 <b>RECEIVED</b>"
+                else
+                  DIFF_CELL=""
+                  DIFF_LABEL="<b>DIFF</b>"
+                  RCV_LABEL="🟢 <b>RECEIVED</b>"
+                fi
+                {
+                  echo '<table>'
+                  echo '<tr>'
+                  printf '<td align="center" width="33%%"><img src="%s" width="280"></td>\n' "$EXPECTED_URL"
+                  printf '<td align="center" width="33%%">%s</td>\n' "$DIFF_CELL"
+                  printf '<td align="center" width="33%%"><img src="%s" width="280"></td>\n' "$RECEIVED_URL"
+                  echo '</tr>'
+                  echo '<tr>'
+                  echo '<td align="center"><b>EXPECTED</b></td>'
+                  printf '<td align="center">%s</td>\n' "$DIFF_LABEL"
+                  printf '<td align="center">%s</td>\n' "$RCV_LABEL"
+                  echo '</tr>'
+                  echo '</table>'
+                  echo ''
+                } >> "$COMMENT_FILE"
+              fi
+            done < <(echo "$recording" | jq -c '.screenshots[]')
+
+            if [ "$STATUS" = "passed" ]; then
+              printf '</details>\n' >> "$COMMENT_FILE"
+            fi
+          done < <(echo "$SORTED" | jq -c '.[]')
+
+          FINAL=$(cat "$COMMENT_FILE")
           PAYLOAD=$(jq -n --arg body "$FINAL" '{"body": $body}')
 
           EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
