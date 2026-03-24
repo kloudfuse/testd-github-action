@@ -155,8 +155,7 @@ jobs:
           FAILURES=$(echo "$RECORDINGS" | jq '[.[] | select(.status != "passed")] | length')
           COMMENT_FILE=$(mktemp)
 
-          # Sort: failed recordings first, then passed
-          SORTED=$(echo "$RECORDINGS" | jq -c '[(.[] | select(.status != "passed")), (.[] | select(.status == "passed"))]')
+
 
           if [ "$FAILURES" -eq 0 ]; then
             SUMMARY=":white_check_mark: All $TOTAL tests passed!"
@@ -171,10 +170,11 @@ jobs:
             STATUS=$(echo "$recording" | jq -r '.status')
 
             if [ "$STATUS" = "passed" ]; then
-              printf '\n<details>\n<summary>:white_check_mark: <b>%s</b></summary>\n\n' "$TEST_NAME" >> "$COMMENT_FILE"
+              ICON=":white_check_mark:"
             else
-              printf '\n### :x: %s\n\n' "$TEST_NAME" >> "$COMMENT_FILE"
+              ICON=":x:"
             fi
+            printf '\n<details>\n<summary>%s <b>%s</b></summary>\n\n' "$ICON" "$TEST_NAME" >> "$COMMENT_FILE"
 
             while IFS= read -r screenshot; do
               EXPECTED_URL=$(echo "$screenshot" | jq -r '.expectedImageUrl // empty')
@@ -184,14 +184,14 @@ jobs:
               if [ -z "$EXPECTED_URL" ]; then
                 # Single column mode — no baseline image (matches DiffTable singleColumn)
                 if [ "$STATUS" != "passed" ]; then
-                  RCV_LABEL="🔴 <b>RECEIVED</b>"
+                  RCV_LABEL="❌ <b>RECEIVED</b>"
                 else
-                  RCV_LABEL="🔵 <b>RECEIVED</b>"
+                  RCV_LABEL="✅ <b>RECEIVED</b>"
                 fi
                 {
-                  echo '<table>'
+                  echo '<table width="100%">'
                   echo '<tr>'
-                  printf '<td align="center"><img src="%s" width="280"></td>\n' "$RECEIVED_URL"
+                  printf '<td align="center"><img src="%s" width="100%%"></td>\n' "$RECEIVED_URL"
                   echo '</tr>'
                   echo '<tr>'
                   printf '<td align="center">%s</td>\n' "$RCV_LABEL"
@@ -202,20 +202,20 @@ jobs:
               else
                 # Three column mode — Expected | Diff | Received (matches DiffTable default)
                 if [ -n "$DIFF_URL" ]; then
-                  DIFF_CELL=$(printf '<img src="%s" width="280">' "$DIFF_URL")
-                  DIFF_LABEL="🔴 <b>DIFF</b>"
-                  RCV_LABEL="🔴 <b>RECEIVED</b>"
+                  DIFF_CELL=$(printf '<img src="%s" width="100%%">' "$DIFF_URL")
+                  DIFF_LABEL="❌ <b>DIFF</b>"
+                  RCV_LABEL="❌ <b>RECEIVED</b>"
                 else
                   DIFF_CELL=""
                   DIFF_LABEL="<b>DIFF</b>"
-                  RCV_LABEL="🟢 <b>RECEIVED</b>"
+                  RCV_LABEL="✅ <b>RECEIVED</b>"
                 fi
                 {
-                  echo '<table>'
+                  echo '<table width="100%">'
                   echo '<tr>'
-                  printf '<td align="center" width="33%%"><img src="%s" width="280"></td>\n' "$EXPECTED_URL"
+                  printf '<td align="center" width="33%%"><img src="%s" width="100%%"></td>\n' "$EXPECTED_URL"
                   printf '<td align="center" width="33%%">%s</td>\n' "$DIFF_CELL"
-                  printf '<td align="center" width="33%%"><img src="%s" width="280"></td>\n' "$RECEIVED_URL"
+                  printf '<td align="center" width="33%%"><img src="%s" width="100%%"></td>\n' "$RECEIVED_URL"
                   echo '</tr>'
                   echo '<tr>'
                   echo '<td align="center"><b>EXPECTED</b></td>'
@@ -228,10 +228,8 @@ jobs:
               fi
             done < <(echo "$recording" | jq -c '.screenshots[]')
 
-            if [ "$STATUS" = "passed" ]; then
-              printf '</details>\n' >> "$COMMENT_FILE"
-            fi
-          done < <(echo "$SORTED" | jq -c '.[]')
+            printf '</details>\n' >> "$COMMENT_FILE"
+          done < <(echo "$RECORDINGS" | jq -c '.[]')
 
           FINAL=$(cat "$COMMENT_FILE")
           PAYLOAD=$(jq -n --arg body "$FINAL" '{"body": $body}')
